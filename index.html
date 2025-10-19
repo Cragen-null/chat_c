@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Bella Chat</title>
+    <link rel="stylesheet" href="/static/Style.css">
+    <style>
+        body, html { margin:0; padding:0; height:100%; overflow:hidden; font-family: Arial,sans-serif; }
+        #video-bg { position: fixed; top:50%; left:50%; width:100%; height:100%; transform:translate(-50%,-50%); object-fit:contain; z-index:-1; }
+        #chat-container { position:absolute; bottom:20px; left:50%; transform:translateX(-50%); width:400px; max-width:90%; background: rgba(255,255,255,0.9); border-radius:10px; padding:10px; box-shadow:0 0 10px rgba(0,0,0,0.3); }
+        #messages { max-height:300px; overflow-y:auto; margin-bottom:10px; }
+        .message { margin:5px 0; padding:5px 10px; border-radius:8px; }
+        .user { background:#a0e7e5; text-align:right; }
+        .assistant { background:#ffb3c1; text-align:left; }
+        #input-container { display:flex; }
+        #input-container input { flex:1; padding:8px; border-radius:5px; border:1px solid #ccc; }
+        #input-container button { padding:8px 12px; margin-left:5px; border-radius:5px; border:none; background-color:#6c63ff; color:white; cursor:pointer; }
+        #volume-bar { width:100%; height:10px; background:#ddd; border-radius:5px; overflow:hidden; margin:5px 0; }
+        #volume-fill { height:100%; width:0%; background:#4caf50; transition:width 0.1s linear; }
+    </style>
+</head>
+<body>
+    <video id="video-bg" autoplay loop muted>
+        <source src="/static/video_resources/idle.mp4" type="video/mp4">
+        動画を再生できません。
+    </video>
+
+    <div id="chat-container">
+        <div id="messages"></div>
+        <div id="volume-bar"><div id="volume-fill"></div></div>
+        <div id="input-container">
+            <input type="text" id="user-input" placeholder="メッセージを入力...">
+            <button id="send-btn">送信</button>
+            <button id="mic-btn">🎤</button>
+        </div>
+    </div>
+
+    <script type="module">
+let audioContext, analyser, micStream, mediaRecorder;
+let isRecording = false, isPlaying = false, silenceStart = null, volumeHistory = [];
+
+const silenceThreshold = 0.04;
+const silenceDuration = 2000;
+const historyLength = 5;
+
+const messagesDiv = document.getElementById("messages");
+const volumeFill = document.getElementById("volume-fill");
+const micBtn = document.getElementById("mic-btn");
+
+// 🎤 マイクボタンでオンオフ
+micBtn.addEventListener("click", async () => {
+    if (!micStream) {
+        await initAudioMonitor();
+        micBtn.textContent = "🎙️監視中";
+    } else {
+        stopMicMonitor();
+        micBtn.textContent = "🎤";
+    }
+});
+// ページロード時に事前キャッシュ開始
+window.addEventListener("DOMContentLoaded", async () => {
+  console.log("🚀 Bella Chat起動 - リアクション音プリロード開始");
+  await preloadReactionsFromServer();
+  console.log("✨ プリロード完了");
+});
+
+// 🔊 マイク監視
+async function initAudioMonitor() {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioContext = new AudioContext();
+    const source = audioContext.createMediaStreamSource(micStream);
+    analyser = audioContext.createAnalyser();
+    analyser.fftSize = 2048;
+    source.connect(analyser);
+    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+    function checkVolume() {
+        analyser.getByteFrequencyData(dataArray);
+        const volume = dataArray.reduce((a,b)=>a+b,0)/dataArray.length/255;
+
+        volumeHistory.push(volume);
+        if(volumeHistory.length>historyLength) volumeHistory.shift();
+        const avgVolume = volumeHistory.reduce((a,b)=>a+b,0)/volumeHistory.length;
+
+        volumeFill.style.width = `${Math.min(avgVolume*500,100)}%`;
+
+        if(!isPlaying){
+            if(avgVolume>silenceThreshold){
+                silenceStart = null;
+                if(!isRecording) startRecording();
+            } else if(isRecording){
+                if(!silenceStart) silenceStart = Date.now();
+                else if(Date.now()-silenceStart>silenceDuration){
+                    // 🎯 非同期でリアクション音を即再生
+                    setTimeout(() => playQuickReaction(), 0);
+
+                    stopRecording();
+                }
+            }
+        }
+
+        requestAnimationFrame(checkVolume);
+    }
+    checkVolume();
+}
+
+// 🎙️ 録音開始
+function startRecording() {
+    const recorder = new MediaRecorder(micStream);
+    mediaRecorder = recorder;
+    const chunks = [];
+    recorder.ondataavailable = e=>chunks.push(e.data);
+    recorder.onstop = async () => {
+        const blob = new Blob(chunks,{type:"audio/webm"});
+        const formData = new FormData();
+        formData.append("file",blob,"recorded.webm");
+
+        // 🎯 録音停止と同時に即座にリアクション音を再生（非同期）
+        //playQuickReaction();
+
+        appendMessage("assistant","🎧 音声処理中...");
+
+        try{
+            const res = await fetch("/whisper",{method:"POST",body:formData});
+            const data = await res.json();
+
+            appendMessage("user",data.user_text);
+            appendMessage("assistant",data.reply);
+
+            await playAudio(data.audio);
+        }catch(e){
+            appendMessage("assistant","エラーが発生しました");
+            console.error(e);
+        }
+    };
+    recorder.start();
+    isRecording = true;
+}
+
+// 🛑 録音停止
+function stopRecording(){
+    if(mediaRecorder && isRecording){
+        mediaRecorder.stop();
+        isRecording=false;
+    }
+}
+
+// 🗣️ リアクション音再生関数
+// =======================================
+// 🌸 Aivisリアクション即時再生システム
+// =======================================
+
+const BASE_URL = "http://127.0.0.1:10101";
+const STYLE_ID = "888753763";
+const reactions = ["はい", "う～ん", "えっと", "ん〜", "そうですね", "なるほど", "了解", "わかりました","えへへ"];
+const cachedReactions = {}; // キャッシュ用
+
+// 起動時キャッシュロード（バックエンドのプリ生成音を取得）
+async function preloadReactionsFromServer() {
+  try {
+    const resList = await Promise.all(
+      reactions.map(r => fetch(`/reaction?text=${encodeURIComponent(r)}`))
+    );
+
+    for (const res of resList) {
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (data.audio) {
+        const blob = base64ToBlob(data.audio, "audio/wav");
+        cachedReactions[data.text] = URL.createObjectURL(blob);
+        console.log(`✅ ${data.text}（サーバーキャッシュ）を読み込み`);
+      }
+    }
+  } catch (err) {
+    console.warn("⚠️ リアクションサーバーキャッシュ読み込み失敗:", err);
+  }
+}
+
+// Base64 → Blob変換
+function base64ToBlob(base64, type = "audio/wav") {
+  const binary = atob(base64);
+  const len = binary.length;
+  const buffer = new Uint8Array(len);
+  for (let i = 0; i < len; i++) buffer[i] = binary.charCodeAt(i);
+  return new Blob([buffer], { type });
+}
+
+
+// 即時再生（キャッシュ利用）
+async function playQuickReaction() {
+  if (Math.random() > 0.6) return; // 反応率40%
+
+  const keys = Object.keys(cachedReactions);
+  const chosen = keys.length > 0 
+      ? keys[Math.floor(Math.random() * keys.length)] 
+      : reactions[Math.floor(Math.random() * reactions.length)];
+
+  if (cachedReactions[chosen]) {
+    // キャッシュ再生
+    const audio = new Audio(cachedReactions[chosen]);
+    audio.play();
+    console.log("🎧 即時リアクション:", chosen);
+  } else {
+    // キャッシュなし → サーバーから取得
+    console.warn(`⚠️ ${chosen} 未キャッシュ → サーバー呼び出し`);
+    try {
+      const res = await fetch(`/reaction?text=${encodeURIComponent(chosen)}`);
+      const data = await res.json();
+      if (data.audio) {
+        const blob = base64ToBlob(data.audio);
+        const url = URL.createObjectURL(blob);
+        cachedReactions[chosen] = url;
+        new Audio(url).play();
+      }
+    } catch (err) {
+      console.error("⚠️ フォールバック失敗:", err);
+    }
+  }
+}
+
+
+// 一時生成（キャッシュにない場合）
+async function playQuickReaction_Fallback() {
+  const chosen = reactions[Math.floor(Math.random() * reactions.length)];
+  try {
+    const queryRes = await fetch(`${BASE_URL}/audio_query?text=${encodeURIComponent(chosen)}&speaker=${STYLE_ID}`, {
+      method: "POST"
+    });
+    const query = await queryRes.json();
+
+    const synthRes = await fetch(`${BASE_URL}/synthesis?speaker=${STYLE_ID}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(query)
+    });
+    const blob = await synthRes.blob();
+
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    audio.play();
+  } catch (err) {
+    console.warn("⚠️ AivisSpeechリアクション生成失敗:", err);
+  }
+}
+
+
+// 🔊 音声再生（AI応答）
+async function playAudio(base64){
+    if(!base64) return;
+    isPlaying = true;
+    const audio = new Audio("data:audio/wav;base64,"+base64);
+    audio.onended = ()=>{ isPlaying=false; };
+    audio.play();
+}
+
+// 💬 メッセージ追加
+function appendMessage(role,text){
+    const div = document.createElement("div");
+    div.className=`message ${role}`;
+    div.textContent=text;
+    messagesDiv.appendChild(div);
+    messagesDiv.scrollTop=messagesDiv.scrollHeight;
+}
+    </script>
+</body>
+</html>
