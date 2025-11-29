@@ -25,15 +25,30 @@ function addMessage(role, text) {
 }
 // 音声再生
 async function playVoice(text) {
-  const res = await fetch("/voice", {
+  const response = await fetch("/voice_stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text }),
   });
-  const blob = await res.blob();
-  const url = URL.createObjectURL(blob);
-  const audio = new Audio(url);
+
+  // MediaSourceを使って受信しながら再生
+  const mediaSource = new MediaSource();
+  const audio = new Audio();
+  audio.src = URL.createObjectURL(mediaSource);
   audio.play();
+
+  mediaSource.addEventListener("sourceopen", async () => {
+    const sourceBuffer = mediaSource.addSourceBuffer('audio/wav; codecs="1"');
+    const reader = response.body.getReader();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      sourceBuffer.appendBuffer(value);
+    }
+
+    mediaSource.endOfStream();
+  });
 }
 
 
@@ -69,11 +84,21 @@ async function sendMessage() {
 
     // 音声が含まれている場合は再生
     if (data.audio) {
-        const audio = new Audio(`data:audio/wav;base64,${data.audio}`);
-        audio.play();
+    const audioBlob = base64ToBlob(data.audio, "audio/wav");
+    const audioUrl = URL.createObjectURL(audioBlob);
+    const audio = new Audio(audioUrl);
+    audio.play();
     }
-    //speakText(data.reply);
-    //playVoice(data.reply); // こちらを使う場合はコメントアウトを外す
+
+    // Base64 → Blob
+    function base64ToBlob(base64, type = "audio/wav") {
+        const binary = atob(base64);
+        const len = binary.length;
+        const buffer = new Uint8Array(len);
+        for (let i = 0; i < len; i++) buffer[i] = binary.charCodeAt(i);
+        return new Blob([buffer], { type });
+    }
+
 
     setTimeout(() => bella.playIdle(), 4000);
 }
